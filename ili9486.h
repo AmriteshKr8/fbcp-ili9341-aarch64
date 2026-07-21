@@ -11,8 +11,8 @@
 #include "waveshare35b.h"
 #endif
 
-#define DISPLAY_NATIVE_WIDTH 320
-#define DISPLAY_NATIVE_HEIGHT 480
+#define DISPLAY_NATIVE_WIDTH 480
+#define DISPLAY_NATIVE_HEIGHT 320
 
 // On ILI9486 the display bus commands and data are 16 bits rather than the usual 8 bits that most other controllers have.
 // (On ILI9486L however the command width is 8 bits, so they are quite different)

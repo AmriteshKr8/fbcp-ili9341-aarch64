@@ -76,9 +76,12 @@ void InitILI9486()
 #ifndef DISPLAY_SWAP_BGR
     madctl |= MADCTL_BGR_PIXEL_ORDER;
 #endif
-#if defined(DISPLAY_FLIP_ORIENTATION_IN_HARDWARE)
+
+    // Set Row/Column exchange (Bit 5) for 90° Hardware Landscape orientation
+#if defined(DISPLAY_OUTPUT_LANDSCAPE) || defined(DISPLAY_FLIP_ORIENTATION_IN_HARDWARE)
     madctl |= MADCTL_ROW_COLUMN_EXCHANGE;
 #endif
+
 #ifdef DISPLAY_ROTATE_180_DEGREES
     madctl ^= MADCTL_ROTATE_180_DEGREES;
 #endif

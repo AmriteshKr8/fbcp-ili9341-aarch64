@@ -70,6 +70,9 @@ static uint16_t *mappedFramebuffer = nullptr;
 static size_t mappedFramebufferSize = 0;
 static uint32_t mappedFbPitch = 0;
 
+static uint32_t drmSrcWidth = 0;
+static uint32_t drmSrcHeight = 0;
+
 static int RoundUpToMultipleOf(int val, int multiple)
 {
   return ((val + multiple - 1) / multiple) * multiple;
@@ -211,7 +214,6 @@ bool SnapshotFramebuffer(uint16_t *destination)
   if (fbId == 0)
     return false;
 
-  // If active framebuffer changed, map the new handle
   if (fbId != currentFbId || !mappedFramebuffer)
   {
     UnmapCurrentDrmBuffer();
@@ -225,6 +227,9 @@ bool SnapshotFramebuffer(uint16_t *destination)
 
     currentFbId = fbId;
     currentHandle = fb->handles[0];
+
+    drmSrcWidth = fb->width;
+    drmSrcHeight = fb->height;
     mappedFbPitch = fb->pitches[0];
     mappedFramebufferSize = fb->height * fb->pitches[0];
 
@@ -252,18 +257,27 @@ bool SnapshotFramebuffer(uint16_t *destination)
     mappedFramebuffer = (uint16_t *)ptr;
   }
 
-  // Copy frame data from DRM mapped buffer to destination
-  const uint32_t srcStridePixels = mappedFbPitch / sizeof(uint16_t);
-  const uint32_t dstStridePixels = gpuFramebufferScanlineStrideBytes / sizeof(uint16_t);
+  if (!mappedFramebuffer || drmSrcWidth == 0 || drmSrcHeight == 0)
+    return false;
 
-  const uint16_t *srcRow = mappedFramebuffer + excessPixelsTop * srcStridePixels + excessPixelsLeft;
-  uint16_t *dstRow = destination;
+  // ----------------------------------------------------------------------------
+  // Scale DRM Source (drmSrcWidth x drmSrcHeight) -> Destination (480 x 320)
+  // ----------------------------------------------------------------------------
+  const uint16_t *src16 = (const uint16_t *)mappedFramebuffer;
+  const uint32_t srcPitch16 = mappedFbPitch / sizeof(uint16_t);
+  const uint32_t dstStride16 = gpuFramebufferScanlineStrideBytes / sizeof(uint16_t);
 
-  for (int y = 0; y < gpuFrameHeight; ++y)
+  for (int y = 0; y < gpuFrameHeight; ++y) // gpuFrameHeight = 320
   {
-    memcpy(dstRow, srcRow, gpuFrameWidth * sizeof(uint16_t));
-    srcRow += srcStridePixels;
-    dstRow += dstStridePixels;
+    uint32_t srcY = (y * drmSrcHeight) / gpuFrameHeight;
+    const uint16_t *srcRow = src16 + srcY * srcPitch16;
+    uint16_t *dstRow = destination + y * dstStride16;
+
+    for (int x = 0; x < gpuFrameWidth; ++x) // gpuFrameWidth = 480
+    {
+      uint32_t srcX = (x * drmSrcWidth) / gpuFrameWidth;
+      dstRow[x] = srcRow[srcX];
+    }
   }
 
   return true;
@@ -377,6 +391,8 @@ void InitGPU()
 
   uint32_t srcWidth = fb->width;
   uint32_t srcHeight = fb->height;
+  drmSrcWidth = srcWidth;
+  drmSrcHeight = srcHeight;
 
   drmModeFreeFB2(fb);
   drmModeFreeCrtc(crtc);

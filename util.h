@@ -24,7 +24,8 @@
 #define FATAL_ERROR(msg) do { pr_alert(msg "\n"); return -1; } while(0)
 #else
 #define LOG(...) do { printf(__VA_ARGS__); printf("\n"); } while(0)
-#define FATAL_ERROR(msg) do { fprintf(stderr, "%s\n", msg); syslog(LOG_ERR, msg); exit(1); } while(0)
+//#define FATAL_ERROR(msg) do { fprintf(stderr, "%s\n", msg); syslog(LOG_ERR, msg); exit(1); } while(0)
+#define FATAL_ERROR(msg, ...) do { fprintf(stderr, msg "\n", ##__VA_ARGS__); syslog(LOG_ERR, msg, ##__VA_ARGS__); exit(1); } while(0)
 #endif
 
 #ifdef KERNEL_MODULE

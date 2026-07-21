@@ -5,6 +5,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 include_directories(/opt/vc/include)
+include_directories(/usr/include/libdrm)
 link_directories(/opt/vc/lib)
 
 file(GLOB sourceFiles *.cpp)
@@ -271,4 +272,11 @@ endif()
 
 add_executable(fbcp-ili9341 ${sourceFiles})
 
-target_link_libraries(fbcp-ili9341 pthread bcm_host atomic)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DRM REQUIRED libdrm)
+include_directories(${DRM_INCLUDE_DIRS})
+
+# Add DRM_LIBRARIES or drm to target_link_libraries
+target_link_libraries(fbcp-ili9341 ${DRM_LIBRARIES} pthread m)
+
+target_link_libraries(fbcp-ili9341 pthread atomic)
