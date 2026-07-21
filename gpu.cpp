@@ -254,29 +254,83 @@ bool SnapshotFramebuffer(uint16_t *destination)
       return false;
     }
 
-    mappedFramebuffer = (uint16_t *)ptr;
+    mappedFramebuffer = static_cast<uint16_t *>(ptr);
   }
 
   if (!mappedFramebuffer || drmSrcWidth == 0 || drmSrcHeight == 0)
     return false;
 
-  // ----------------------------------------------------------------------------
-  // Scale DRM Source (drmSrcWidth x drmSrcHeight) -> Destination (480 x 320)
-  // ----------------------------------------------------------------------------
-  const uint16_t *src16 = (const uint16_t *)mappedFramebuffer;
-  const uint32_t srcPitch16 = mappedFbPitch / sizeof(uint16_t);
-  const uint32_t dstStride16 = gpuFramebufferScanlineStrideBytes / sizeof(uint16_t);
+  // Calculate destination pitch & stride
+  const uint32_t dstPitchBytes = (gpuFramebufferScanlineStrideBytes > 0) 
+                                 ? gpuFramebufferScanlineStrideBytes 
+                                 : (gpuFrameWidth * sizeof(uint16_t));
+  const uint32_t dstStride16 = dstPitchBytes / sizeof(uint16_t);
 
-  for (int y = 0; y < gpuFrameHeight; ++y) // gpuFrameHeight = 320
+  const auto *srcBytes = reinterpret_cast<const uint8_t *>(mappedFramebuffer);
+  auto *dstBytes = reinterpret_cast<uint8_t *>(destination);
+
+  // Detect 32-bit (XRGB8888/ARGB8888) vs 16-bit (RGB565) source
+  bool is32bpp = (mappedFbPitch >= drmSrcWidth * 4);
+
+  if (is32bpp)
   {
-    uint32_t srcY = (y * drmSrcHeight) / gpuFrameHeight;
-    const uint16_t *srcRow = src16 + srcY * srcPitch16;
-    uint16_t *dstRow = destination + y * dstStride16;
-
-    for (int x = 0; x < gpuFrameWidth; ++x) // gpuFrameWidth = 480
+    // ------------------------------------------------------------------------
+    // 32-bit (Sway / Wayland) -> 16-bit RGB565 Downsampler
+    // Reads exact byte offsets (B, G, R) and safely ignores Alpha/X byte (0xFF)
+    // ------------------------------------------------------------------------
+    for (uint32_t y = 0; y < gpuFrameHeight; ++y)
     {
-      uint32_t srcX = (x * drmSrcWidth) / gpuFrameWidth;
-      dstRow[x] = srcRow[srcX];
+      uint32_t srcY = (y * drmSrcHeight) / gpuFrameHeight;
+      const uint8_t *srcRow = srcBytes + (srcY * mappedFbPitch);
+      uint16_t *dstRow = destination + (y * dstStride16);
+
+      for (uint32_t x = 0; x < gpuFrameWidth; ++x)
+      {
+        uint32_t srcX = (x * drmSrcWidth) / gpuFrameWidth;
+        const uint8_t *px = srcRow + (srcX * 4);
+
+        // Little-endian memory layout for DRM_FORMAT_XRGB8888:
+        uint8_t b = px[0];
+        uint8_t g = px[1];
+        uint8_t r = px[2];
+        // px[3] is Alpha/Padding (0xFF) — ignored!
+
+        // Pack into 16-bit RGB565
+        dstRow[x] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+      }
+    }
+  }
+  else
+  {
+    // ------------------------------------------------------------------------
+    // 16-bit (TTY / fbcon) Path
+    // ------------------------------------------------------------------------
+    if (drmSrcWidth == gpuFrameWidth && drmSrcHeight == gpuFrameHeight)
+    {
+      // Fast path: 1:1 scanline copy
+      const uint32_t copyBytes = gpuFrameWidth * sizeof(uint16_t);
+      for (uint32_t y = 0; y < gpuFrameHeight; ++y)
+      {
+        const uint16_t *srcRow = reinterpret_cast<const uint16_t *>(srcBytes + y * mappedFbPitch);
+        uint16_t *dstRow = reinterpret_cast<uint16_t *>(dstBytes + y * dstPitchBytes);
+        memcpy(dstRow, srcRow, copyBytes);
+      }
+    }
+    else
+    {
+      // Resampled path
+      for (uint32_t y = 0; y < gpuFrameHeight; ++y)
+      {
+        uint32_t srcY = (y * drmSrcHeight) / gpuFrameHeight;
+        const uint16_t *srcRow = reinterpret_cast<const uint16_t *>(srcBytes + srcY * mappedFbPitch);
+        uint16_t *dstRow = reinterpret_cast<uint16_t *>(dstBytes + y * dstPitchBytes);
+
+        for (uint32_t x = 0; x < gpuFrameWidth; ++x)
+        {
+          uint32_t srcX = (x * drmSrcWidth) / gpuFrameWidth;
+          dstRow[x] = srcRow[srcX];
+        }
+      }
     }
   }
 
@@ -352,7 +406,7 @@ void InitGPU()
   drmFd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
   if (drmFd < 0)
     FATAL_ERROR("Failed to open /dev/dri/card0");
-
+  drmDropMaster(drmFd);
   printf("Opened DRM device /dev/dri/card0 successfully.\n");
 
   // 2. Discover active CRTC
