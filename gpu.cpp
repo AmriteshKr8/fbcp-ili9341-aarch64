@@ -197,13 +197,34 @@ static void UnmapCurrentDrmBuffer()
 // ----------------------------------------------------------------------------
 // Snapshot Framebuffer via DRM KMS
 // ----------------------------------------------------------------------------
+#include <unordered_map>
+
+struct MappedBuffer {
+  void *ptr;
+  size_t size;
+  uint32_t width;
+  uint32_t height;
+  uint32_t pitch;
+};
+
+static std::unordered_map<uint32_t, MappedBuffer> drmBufferCache;
+
+void CleanupDrmBufferCache()
+{
+  for (auto &pair : drmBufferCache)
+  {
+    if (pair.second.ptr && pair.second.ptr != MAP_FAILED)
+      munmap(pair.second.ptr, pair.second.size);
+  }
+  drmBufferCache.clear();
+}
+
 bool SnapshotFramebuffer(uint16_t *destination)
 {
-  lastFramePollTime = tick();
-
   if (drmFd < 0 || drmCrtcId == 0)
     return false;
 
+  // 1. Query active CRTC
   drmModeCrtc *crtc = drmModeGetCrtc(drmFd, drmCrtcId);
   if (!crtc)
     return false;
@@ -214,122 +235,109 @@ bool SnapshotFramebuffer(uint16_t *destination)
   if (fbId == 0)
     return false;
 
-  if (fbId != currentFbId || !mappedFramebuffer)
-  {
-    UnmapCurrentDrmBuffer();
+  // ------------------------------------------------------------------------
+  // ZERO-COPY IDLE SHORT-CIRCUIT
+  // ------------------------------------------------------------------------
+  static uint32_t lastProcessedFbId = 0;
 
-    drmModeFB2 *fb = drmModeGetFB2(drmFd, fbId);
-    if (!fb)
+  void *mappedPtr = nullptr;
+  auto it = drmBufferCache.find(fbId);
+
+  if (it != drmBufferCache.end())
+  {
+    mappedPtr = it->second.ptr;
+    drmSrcWidth = it->second.width;
+    drmSrcHeight = it->second.height;
+    mappedFbPitch = it->second.pitch;
+  }
+  else
+  {
+    // Prevent buffer cache leak: Evict cache if Sway creates too many unique FBs
+    if (drmBufferCache.size() > 16)
     {
-      perror("drmModeGetFB2");
-      return false;
+      CleanupDrmBufferCache();
     }
 
-    currentFbId = fbId;
-    currentHandle = fb->handles[0];
+    drmModeFB2 *fb = drmModeGetFB2(drmFd, fbId);
+    if (!fb) return false;
 
     drmSrcWidth = fb->width;
     drmSrcHeight = fb->height;
     mappedFbPitch = fb->pitches[0];
-    mappedFramebufferSize = fb->height * fb->pitches[0];
+    size_t fbSize = fb->height * fb->pitches[0];
 
     drm_mode_map_dumb map = {};
-    map.handle = currentHandle;
+    map.handle = fb->handles[0];
 
-    if (ioctl(drmFd, DRM_IOCTL_MODE_MAP_DUMB, &map) < 0)
+    if (ioctl(drmFd, DRM_IOCTL_MODE_MAP_DUMB, &map) >= 0)
     {
-      perror("DRM_IOCTL_MODE_MAP_DUMB");
-      drmModeFreeFB2(fb);
-      return false;
+      void *ptr = mmap(nullptr, fbSize, PROT_READ, MAP_SHARED, drmFd, map.offset);
+      if (ptr != MAP_FAILED)
+      {
+        drmBufferCache[fbId] = {ptr, fbSize, drmSrcWidth, drmSrcHeight, mappedFbPitch};
+        mappedPtr = ptr;
+      }
     }
-
-    void *ptr = mmap(nullptr, mappedFramebufferSize, PROT_READ, MAP_SHARED, drmFd, map.offset);
     drmModeFreeFB2(fb);
-
-    if (ptr == MAP_FAILED)
-    {
-      perror("mmap");
-      currentFbId = 0;
-      currentHandle = 0;
-      return false;
-    }
-
-    mappedFramebuffer = static_cast<uint16_t *>(ptr);
   }
 
-  if (!mappedFramebuffer || drmSrcWidth == 0 || drmSrcHeight == 0)
+  if (!mappedPtr || drmSrcWidth == 0 || drmSrcHeight == 0)
     return false;
 
-  // Calculate destination pitch & stride
+  bool is32bpp = (mappedFbPitch >= drmSrcWidth * 4);
+
+  // Short-circuit if framebuffer hasn't flipped
+  if (is32bpp && fbId == lastProcessedFbId)
+  {
+    return false;
+  }
+
   const uint32_t dstPitchBytes = (gpuFramebufferScanlineStrideBytes > 0) 
                                  ? gpuFramebufferScanlineStrideBytes 
                                  : (gpuFrameWidth * sizeof(uint16_t));
   const uint32_t dstStride16 = dstPitchBytes / sizeof(uint16_t);
 
-  const auto *srcBytes = reinterpret_cast<const uint8_t *>(mappedFramebuffer);
-  auto *dstBytes = reinterpret_cast<uint8_t *>(destination);
-
-  // Detect 32-bit (XRGB8888/ARGB8888) vs 16-bit (RGB565) source
-  bool is32bpp = (mappedFbPitch >= drmSrcWidth * 4);
+  const auto *srcBytes = reinterpret_cast<const uint8_t *>(mappedPtr);
 
   if (is32bpp)
   {
-    // ------------------------------------------------------------------------
-    // 32-bit (Sway / Wayland) -> 16-bit RGB565 Downsampler
-    // Reads exact byte offsets (B, G, R) and safely ignores Alpha/X byte (0xFF)
-    // ------------------------------------------------------------------------
+    lastProcessedFbId = fbId;
+
+    alignas(16) uint32_t cachedRow[640]; 
+    const uint32_t rowCopyBytes = gpuFrameWidth * 4;
+
     for (uint32_t y = 0; y < gpuFrameHeight; ++y)
     {
-      uint32_t srcY = (y * drmSrcHeight) / gpuFrameHeight;
-      const uint8_t *srcRow = srcBytes + (srcY * mappedFbPitch);
+      const uint8_t *uncachedSrcRow = srcBytes + (y * mappedFbPitch);
       uint16_t *dstRow = destination + (y * dstStride16);
+
+      memcpy(cachedRow, uncachedSrcRow, rowCopyBytes);
 
       for (uint32_t x = 0; x < gpuFrameWidth; ++x)
       {
-        uint32_t srcX = (x * drmSrcWidth) / gpuFrameWidth;
-        const uint8_t *px = srcRow + (srcX * 4);
+        uint32_t pixel = cachedRow[x];
+        uint8_t r = (pixel >> 16) & 0xFF;
+        uint8_t g = (pixel >> 8)  & 0xFF;
+        uint8_t b = pixel & 0xFF;
 
-        // Little-endian memory layout for DRM_FORMAT_XRGB8888:
-        uint8_t b = px[0];
-        uint8_t g = px[1];
-        uint8_t r = px[2];
-        // px[3] is Alpha/Padding (0xFF) — ignored!
-
-        // Pack into 16-bit RGB565
         dstRow[x] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
       }
     }
   }
   else
   {
-    // ------------------------------------------------------------------------
-    // 16-bit (TTY / fbcon) Path
-    // ------------------------------------------------------------------------
-    if (drmSrcWidth == gpuFrameWidth && drmSrcHeight == gpuFrameHeight)
+    if (mappedFbPitch == dstPitchBytes)
     {
-      // Fast path: 1:1 scanline copy
+      memcpy(destination, srcBytes, gpuFrameHeight * dstPitchBytes);
+    }
+    else
+    {
       const uint32_t copyBytes = gpuFrameWidth * sizeof(uint16_t);
       for (uint32_t y = 0; y < gpuFrameHeight; ++y)
       {
         const uint16_t *srcRow = reinterpret_cast<const uint16_t *>(srcBytes + y * mappedFbPitch);
-        uint16_t *dstRow = reinterpret_cast<uint16_t *>(dstBytes + y * dstPitchBytes);
+        uint16_t *dstRow = reinterpret_cast<uint16_t *>(reinterpret_cast<uint8_t *>(destination) + y * dstPitchBytes);
         memcpy(dstRow, srcRow, copyBytes);
-      }
-    }
-    else
-    {
-      // Resampled path
-      for (uint32_t y = 0; y < gpuFrameHeight; ++y)
-      {
-        uint32_t srcY = (y * drmSrcHeight) / gpuFrameHeight;
-        const uint16_t *srcRow = reinterpret_cast<const uint16_t *>(srcBytes + srcY * mappedFbPitch);
-        uint16_t *dstRow = reinterpret_cast<uint16_t *>(dstBytes + y * dstPitchBytes);
-
-        for (uint32_t x = 0; x < gpuFrameWidth; ++x)
-        {
-          uint32_t srcX = (x * drmSrcWidth) / gpuFrameWidth;
-          dstRow[x] = srcRow[srcX];
-        }
       }
     }
   }
@@ -338,60 +346,45 @@ bool SnapshotFramebuffer(uint16_t *destination)
 }
 
 // ----------------------------------------------------------------------------
-// GPU Polling Thread Routine
+// Simplified DRM GPU Polling Thread (No Battery-Prediction Drift)
 // ----------------------------------------------------------------------------
 extern volatile bool programRunning;
 
 void *gpu_polling_thread(void *)
 {
-  uint64_t lastNewFrameReceivedTime = tick();
+  const uint64_t TARGET_FRAME_TIME_US = 1000000 / 60; // Hard 60 Hz target
+  uint64_t lastFrameTime = tick();
 
   while (programRunning)
   {
-#ifdef SAVE_BATTERY_BY_SLEEPING_UNTIL_TARGET_FRAME
-    const int64_t earlyFramePrediction = 500;
-    uint64_t earliestNextFrameArrivaltime = lastNewFrameReceivedTime + 1000000 / TARGET_FRAME_RATE - earlyFramePrediction;
     uint64_t now = tick();
-    if (earliestNextFrameArrivaltime > now)
-      usleep(earliestNextFrameArrivaltime - now);
-#endif
-
-#if defined(SAVE_BATTERY_BY_PREDICTING_FRAME_ARRIVAL_TIMES) || defined(SAVE_BATTERY_BY_SLEEPING_WHEN_IDLE)
-    uint64_t nextFrameArrivalTime = PredictNextFrameArrivalTime();
-    int64_t timeToSleep = nextFrameArrivalTime - tick();
-    const int64_t minimumSleepTime = 150;
-    if (timeToSleep > minimumSleepTime)
-      usleep(timeToSleep - minimumSleepTime);
-#endif
+    
+    // Pace to 60 FPS cleanly
+    if (now - lastFrameTime < TARGET_FRAME_TIME_US)
+    {
+      uint64_t sleepUs = TARGET_FRAME_TIME_US - (now - lastFrameTime);
+      if (sleepUs > 500)
+        usleep(sleepUs - 200); // Sleep with 200us margin to prevent oversleeping
+    }
 
     uint64_t t0 = tick();
 
     bool gotNewFramebuffer = SnapshotFramebuffer(videoCoreFramebuffer[0]);
     gotNewFramebuffer = gotNewFramebuffer && IsNewFramebuffer(videoCoreFramebuffer[0], videoCoreFramebuffer[1]);
 
-    if (gotNewFramebuffer)
-    {
-      lastNewFrameReceivedTime = t0;
-      AddHistogramSample(lastNewFrameReceivedTime);
-    }
-
-    uint64_t t1 = tick();
-
     if (!gotNewFramebuffer)
     {
-#ifdef STATISTICS
-      __atomic_fetch_add(&timeWastedPollingGPU, t1 - t0, __ATOMIC_RELAXED);
-#endif
-      eagerFastTrackToSnapshottingFramesEarlierFactor /= 2;
+      // Idle path: Tiny yield to avoid 100% spin without dropping frame response
+      usleep(1000); 
       continue;
     }
-    else
-    {
-      ++eagerFastTrackToSnapshottingFramesEarlierFactor;
-      memcpy(videoCoreFramebuffer[1], videoCoreFramebuffer[0], gpuFramebufferSizeBytes);
-      __atomic_fetch_add(&numNewGpuFrames, 1, __ATOMIC_SEQ_CST);
-      syscall(SYS_futex, &numNewGpuFrames, FUTEX_WAKE, 1, 0, 0, 0);
-    }
+
+    lastFrameTime = t0;
+
+    // Send frame downstream
+    memcpy(videoCoreFramebuffer[1], videoCoreFramebuffer[0], gpuFramebufferSizeBytes);
+    __atomic_fetch_add(&numNewGpuFrames, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, &numNewGpuFrames, FUTEX_WAKE, 1, 0, 0, 0);
   }
 
   pthread_exit(0);

@@ -32,21 +32,17 @@ static uintptr_t get_bcm_peripheral_address() {
     }
     fclose(fp);
   }
-  // Fallback default (0xFE000000 for BCM2711 / Pi 4, 0x3F000000 for Pi 3)
   if (!address) address = 0xFE000000;
   return address;
 }
 
 static uint32_t get_bcm_peripheral_size() {
-  return 0x01000000; // Standard 16MB peripheral address window
+  return 0x01000000;
 }
 
 static uintptr_t get_bcm_sdram_address() {
-  return 0xC0000000; // VC bus alias address
+  return 0xC0000000;
 }
-
-// Uncomment this to print out all bytes sent to the SPI bus
-// #define DEBUG_SPI_BUS_WRITES
 
 #ifdef DEBUG_SPI_BUS_WRITES
 #define DEBUG_PRINT_WRITTEN_BYTE(byte) do { \
@@ -102,7 +98,6 @@ void DumpSPICS(uint32_t reg)
 }
 
 #ifdef RUN_WITH_REALTIME_THREAD_PRIORITY
-
 #include <pthread.h>
 #include <sched.h>
 
@@ -121,7 +116,6 @@ void SetRealtimeThreadPriority()
   if (policy != SCHED_FIFO) FATAL_ERROR("Failed to set realtime thread policy!");
   printf("Set fbcp-ili9341 thread scheduling priority to maximum (%d)\n", sched_get_priority_max(SCHED_FIFO));
 }
-
 #endif
 
 #define UNLOCK_FAST_8_CLOCKS_SPI() (spi->dlen = 2)
@@ -218,14 +212,12 @@ void Interleave8BitSPITaskTo9Bit(SPITask *task)
 void Interleave16BitSPITaskTo32Bit(SPITask *task)
 {
   const uint32_t size8BitTask = task->size - task->sizeExpandedTaskWithPadding;
-
   uint32_t *dst = (uint32_t *)(task->data + size8BitTask);
   *dst++ = task->cmd;
-
-  const uint32_t taskSizeU16 = size8BitTask >> 1;
-  uint16_t *src = (uint16_t*)task->data;
-  for(uint32_t i = 0; i < taskSizeU16; ++i)
-    dst[i] = 0x1500 | (src[i] << 16);
+  const uint16_t *src = (const uint16_t*)task->data;
+  const uint16_t *end = src + (size8BitTask >> 1);
+  while(src < end)
+    *dst++ = 0x1500 | ((uint32_t)*src++ << 16);
 }
 
 #endif // ~SPI_3WIRE_PROTOCOL
@@ -234,10 +226,13 @@ void WaitForPolledSPITransferToFinish()
 {
   uint32_t cs;
   while (!(((cs = spi->cs) ^ BCM2835_SPI0_CS_TA) & (BCM2835_SPI0_CS_DONE | BCM2835_SPI0_CS_TA)))
-    if ((cs & (BCM2835_SPI0_CS_RXR | BCM2835_SPI0_CS_RXF)))
+  {
+    if (cs & (BCM2835_SPI0_CS_RXR | BCM2835_SPI0_CS_RXF))
       spi->cs = BCM2835_SPI0_CS_CLEAR_RX | BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS;
+  }
 
-  if ((cs & BCM2835_SPI0_CS_RXD)) spi->cs = BCM2835_SPI0_CS_CLEAR_RX | BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS;
+  if (cs & BCM2835_SPI0_CS_RXD) 
+    spi->cs = BCM2835_SPI0_CS_CLEAR_RX | BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS;
 }
 
 #ifdef ALL_TASKS_SHOULD_DMA
@@ -248,7 +243,6 @@ void WaitForPolledSPITransferToFinish()
 
 void RunSPITask(SPITask *task)
 {
-  uint32_t cs;
   uint8_t *tStart = task->PayloadStart();
   uint8_t *tEnd = task->PayloadEnd();
   const uint32_t payloadSize = tEnd - tStart;
@@ -283,8 +277,8 @@ void RunSPITask(SPITask *task)
 
 #ifdef DISPLAY_SPI_BUS_IS_16BITS_WIDE
     while(!(spi->cs & (BCM2835_SPI0_CS_DONE))) /*nop*/;
-    spi->fifo;
-    spi->fifo;
+    (void)spi->fifo;
+    (void)spi->fifo;
 #else
     while(!(spi->cs & (BCM2835_SPI0_CS_RXD|BCM2835_SPI0_CS_DONE))) /*nop*/;
 #endif
@@ -293,11 +287,15 @@ void RunSPITask(SPITask *task)
 #endif
 
     while(tStart < tPrefillEnd) WRITE_FIFO(*tStart++);
+
+    // SAFE POLLED LOOP: Exact 1-byte writes on TXD to prevent FIFO overflow
     while(tStart < tEnd)
     {
-      cs = spi->cs;
-      if ((cs & BCM2835_SPI0_CS_TXD)) WRITE_FIFO(*tStart++);
-      if ((cs & (BCM2835_SPI0_CS_RXR|BCM2835_SPI0_CS_RXF))) spi->cs = BCM2835_SPI0_CS_CLEAR_RX | BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS;
+      uint32_t cs = spi->cs;
+      if (cs & BCM2835_SPI0_CS_TXD)
+        WRITE_FIFO(*tStart++);
+      if (cs & (BCM2835_SPI0_CS_RXR|BCM2835_SPI0_CS_RXF))
+        spi->cs = BCM2835_SPI0_CS_CLEAR_RX | BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS;
     }
 
     previousTaskWasSPI = true;
@@ -328,8 +326,8 @@ void RunSPITask(SPITask *task)
 
 #ifdef DISPLAY_SPI_BUS_IS_16BITS_WIDE
   while(!(spi->cs & (BCM2835_SPI0_CS_DONE))) /*nop*/;
-  spi->fifo;
-  spi->fifo;
+  (void)spi->fifo;
+  (void)spi->fifo;
 #else
   while(!(spi->cs & (BCM2835_SPI0_CS_RXD|BCM2835_SPI0_CS_DONE))) /*nop*/;
 #endif
@@ -348,11 +346,15 @@ void RunSPITask(SPITask *task)
 #endif
   {
     while(tStart < tPrefillEnd) WRITE_FIFO(*tStart++);
+
+    // SAFE POLLED LOOP: Exact 1-byte writes on TXD to prevent FIFO overflow
     while(tStart < tEnd)
     {
       uint32_t cs = spi->cs;
-      if ((cs & BCM2835_SPI0_CS_TXD)) WRITE_FIFO(*tStart++);
-      if ((cs & (BCM2835_SPI0_CS_RXR|BCM2835_SPI0_CS_RXF))) spi->cs = BCM2835_SPI0_CS_CLEAR_RX | BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS;
+      if (cs & BCM2835_SPI0_CS_TXD)
+        WRITE_FIFO(*tStart++);
+      if (cs & (BCM2835_SPI0_CS_RXR|BCM2835_SPI0_CS_RXF))
+        spi->cs = BCM2835_SPI0_CS_CLEAR_RX | BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS;
     }
   }
 
@@ -377,7 +379,7 @@ SPITask *GetTask()
   if (task->cmd == 0)
   {
     spiTaskMemory->queueHead = 0;
-    __sync_synchronize();
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (tail == 0) return 0;
     task = (SPITask*)spiTaskMemory->buffer;
   }
@@ -388,7 +390,7 @@ void DoneTask(SPITask *task)
 {
   __atomic_fetch_sub(&spiTaskMemory->spiBytesQueued, task->PayloadSize()+1, __ATOMIC_RELAXED);
   spiTaskMemory->queueHead = (uint32_t)((uint8_t*)task - spiTaskMemory->buffer) + sizeof(SPITask) + task->size;
-  __sync_synchronize();
+  __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
 extern volatile bool programRunning;
@@ -439,7 +441,7 @@ void *spi_thread(void *unused)
 #ifdef STATISTICS
       __atomic_store_n(&spiThreadSleeping, 0, __ATOMIC_RELAXED);
       uint64_t t1 = tick();
-      __sync_fetch_and_add(&spiThreadIdleUsecs, t1-t0);
+      __atomic_fetch_add(&spiThreadIdleUsecs, t1-t0, __ATOMIC_RELAXED);
 #endif
     }
   }
@@ -461,7 +463,7 @@ int InitSPI()
   spi = (volatile SPIRegisterFile*)((uintptr_t)bcm2835 + BCM2835_SPI0_BASE - BCM2835_GPIO_BASE);
   gpio = (volatile GPIORegisterFile*)((uintptr_t)bcm2835);
 
-#else // Userland version
+#else
   mem_fd = open("/dev/mem", O_RDWR|O_SYNC);
   if (mem_fd < 0) FATAL_ERROR("can't open /dev/mem (run as sudo)");
 

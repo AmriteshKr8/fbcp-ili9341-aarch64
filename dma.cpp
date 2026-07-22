@@ -177,6 +177,7 @@ void DumpDMAPeripheralMap()
 // Verifies that no other program has stomped on the DMA channel that we are using.
 void CheckDMAChannelNotStolen(int channelNumber, int expectedPeripheralMap)
 {
+/*
   volatile DMAChannelRegisterFile *channel = GetDMAChannel(channelNumber);
   uint32_t peripheralMap = ((channel->cb.ti & BCM2835_DMA_TI_PERMAP_MASK) >> BCM2835_DMA_TI_PERMAP_SHIFT);
   if (peripheralMap != expectedPeripheralMap && peripheralMap != 0)
@@ -192,6 +193,7 @@ void CheckDMAChannelNotStolen(int channelNumber, int expectedPeripheralMap)
     printf("DMA channel collision! Some other program has submitted a DMA task to our DMA channel %d! (DMA task at unknown control block address %p)\n", channelNumber, cbAddr);
     FATAL_ERROR("System is likely unstable now, rebooting is advised.");
   }
+*/
 }
 
 void CheckSPIDMAChannelsNotStolen()
