@@ -240,7 +240,7 @@ DISPLAY_BREAK_ASPECT_RATIO_WHEN_SCALING:BOOL=OFF
 //If ON, displays the cropped center part of the source image on
 // the SPI display. If OFF, scales the source image to the SPI
 // display
-DISPLAY_CROPPED_INSTEAD_OF_SCALING:BOOL=ON
+DISPLAY_CROPPED_INSTEAD_OF_SCALING:BOOL=OFF
 
 //If true, inverts display colors (white=0, black=31/63
 DISPLAY_INVERT_COLORS:BOOL=OFF

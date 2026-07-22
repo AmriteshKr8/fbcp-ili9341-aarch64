@@ -6,5 +6,5 @@ CXX_DEFINES =
 
 CXX_INCLUDES = -I/opt/vc/include -I/usr/include/libdrm
 
-CXX_FLAGS =  -marm -mabi=aapcs-linux -mhard-float -mfloat-abi=hard -mlittle-endian -mtls-dialect=gnu2 -funsafe-math-optimizations -DGPIO_TFT_DATA_CONTROL=24 -DGPIO_TFT_RESET_PIN=25 -DDISPLAY_CROPPED_INSTEAD_OF_SCALING -DSTATISTICS -DSPI_BUS_CLOCK_DIVISOR=8 -DDISPLAY_ROTATE_180_DEGREES -DUSE_DMA_TRANSFERS=1 -DILI9486 -O3 -DNDEBUG
+CXX_FLAGS =  -marm -mabi=aapcs-linux -mhard-float -mfloat-abi=hard -mlittle-endian -mtls-dialect=gnu2 -funsafe-math-optimizations -DGPIO_TFT_DATA_CONTROL=24 -DGPIO_TFT_RESET_PIN=25 -DSTATISTICS -DSPI_BUS_CLOCK_DIVISOR=8 -DDISPLAY_ROTATE_180_DEGREES -DUSE_DMA_TRANSFERS=1 -DILI9486 -O3 -DNDEBUG
 

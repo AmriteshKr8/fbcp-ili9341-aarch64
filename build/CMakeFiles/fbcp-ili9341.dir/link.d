@@ -24,9 +24,6 @@ fbcp-ili9341: \
   CMakeFiles/fbcp-ili9341.dir/text.cpp.o \
   /lib/arm-linux-gnueabihf/libdrm.so \
   /usr/lib/gcc-cross/arm-linux-gnueabihf/14/../../../../arm-linux-gnueabihf/lib/libpthread.a \
-  /usr/lib/gcc-cross/arm-linux-gnueabihf/14/../../../../arm-linux-gnueabihf/lib/libpthread.a \
-  /usr/lib/gcc-cross/arm-linux-gnueabihf/14/libatomic.so \
-  /usr/lib/gcc-cross/arm-linux-gnueabihf/14/../../../../arm-linux-gnueabihf/lib/libm.so \
   /usr/lib/gcc-cross/arm-linux-gnueabihf/14/libatomic.so \
   /usr/lib/gcc-cross/arm-linux-gnueabihf/14/libstdc++.so \
   /usr/lib/gcc-cross/arm-linux-gnueabihf/14/../../../../arm-linux-gnueabihf/lib/libm.so \
@@ -102,12 +99,6 @@ CMakeFiles/fbcp-ili9341.dir/text.cpp.o:
 /lib/arm-linux-gnueabihf/libdrm.so:
 
 /usr/lib/gcc-cross/arm-linux-gnueabihf/14/../../../../arm-linux-gnueabihf/lib/libpthread.a:
-
-/usr/lib/gcc-cross/arm-linux-gnueabihf/14/../../../../arm-linux-gnueabihf/lib/libpthread.a:
-
-/usr/lib/gcc-cross/arm-linux-gnueabihf/14/libatomic.so:
-
-/usr/lib/gcc-cross/arm-linux-gnueabihf/14/../../../../arm-linux-gnueabihf/lib/libm.so:
 
 /usr/lib/gcc-cross/arm-linux-gnueabihf/14/libatomic.so:
 

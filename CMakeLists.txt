@@ -277,6 +277,4 @@ pkg_check_modules(DRM REQUIRED libdrm)
 include_directories(${DRM_INCLUDE_DIRS})
 
 # Add DRM_LIBRARIES or drm to target_link_libraries
-target_link_libraries(fbcp-ili9341 ${DRM_LIBRARIES} pthread m)
-
-target_link_libraries(fbcp-ili9341 pthread atomic)
+target_link_libraries(fbcp-ili9341 ${DRM_LIBRARIES} pthread m atomic)
