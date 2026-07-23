@@ -1,3 +1,0 @@
-/home/ak/fbcp-ili9341-aarch64/build/CMakeFiles/fbcp-ili9341.dir
-/home/ak/fbcp-ili9341-aarch64/build/CMakeFiles/edit_cache.dir
-/home/ak/fbcp-ili9341-aarch64/build/CMakeFiles/rebuild_cache.dir
