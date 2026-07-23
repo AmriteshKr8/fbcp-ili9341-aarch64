@@ -24,6 +24,11 @@
 #include "statistics.h"
 #include "mem_alloc.h"
 
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 bool MarkProgramQuitting(void);
 
 // ----------------------------------------------------------------------------
@@ -219,40 +224,237 @@ void CleanupDrmBufferCache()
   drmBufferCache.clear();
 }
 
+// ------------------------------------------------------------------------
+// LUT RESCALING GLOBALS
+// ------------------------------------------------------------------------
+static int drmUeventFd = -1;
+
+static uint32_t *lutX = nullptr;
+static uint32_t *lutY = nullptr;
+static uint32_t lutSrcWidth = 0;
+static uint32_t lutSrcHeight = 0;
+static bool isRescalingNeeded = false;
+
+static uint32_t *cachedSrcRow = nullptr;
+static size_t cachedSrcRowCapacityPixels = 0;
+
+// ------------------------------------------------------------------------
+// DRM NETLINK UEVENT LISTENER
+// ------------------------------------------------------------------------
+static void InitDrmUeventListener()
+{
+  drmUeventFd = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+  if (drmUeventFd < 0)
+  {
+    printf("[DRM] Warning: Failed to create Netlink uevent socket.\n");
+    return;
+  }
+
+  struct sockaddr_nl sa = {};
+  sa.nl_family = AF_NETLINK;
+  sa.nl_groups = 1; // Kernel multicast group for uevents
+
+  if (bind(drmUeventFd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+  {
+    printf("[DRM] Warning: Failed to bind Netlink uevent socket.\n");
+    close(drmUeventFd);
+    drmUeventFd = -1;
+    return;
+  }
+
+  // Set non-blocking mode so event checking never delays frame capture
+  int flags = fcntl(drmUeventFd, F_GETFL, 0);
+  fcntl(drmUeventFd, F_SETFL, flags | O_NONBLOCK);
+
+  printf("[DRM] Kernel uevent listener initialized on fd %d.\n", drmUeventFd);
+}
+
+static bool CheckDrmUevents()
+{
+  if (drmUeventFd < 0)
+    return false;
+
+  char buffer[2048];
+  bool eventDetected = false;
+
+  // Drain all pending messages in socket buffer
+  while (true)
+  {
+    ssize_t len = recv(drmUeventFd, buffer, sizeof(buffer) - 1, 0);
+    if (len <= 0)
+      break;
+
+    buffer[len] = '\0';
+
+    bool isDrm = false;
+    bool isHotplugOrChange = false;
+
+    char *ptr = buffer;
+    while (ptr < buffer + len)
+    {
+      if (strcmp(ptr, "SUBSYSTEM=drm") == 0)
+      {
+        isDrm = true;
+      }
+      else if (strcmp(ptr, "HOTPLUG=1") == 0 || strncmp(ptr, "ACTION=change", 13) == 0)
+      {
+        isHotplugOrChange = true;
+      }
+
+      ptr += strlen(ptr) + 1;
+    }
+
+    if (isDrm && isHotplugOrChange)
+    {
+      eventDetected = true;
+    }
+  }
+
+  return eventDetected;
+}
+
+// ------------------------------------------------------------------------
+// DYNAMIC LUT REBUILD
+// ------------------------------------------------------------------------
+static void EnsureLutUpdated(uint32_t currentSrcWidth, uint32_t currentSrcHeight)
+{
+  // Short-circuit if current LUT mapping matches active framebuffer dimensions
+  if (currentSrcWidth == lutSrcWidth && currentSrcHeight == lutSrcHeight && lutX != nullptr)
+    return;
+
+  lutSrcWidth = currentSrcWidth;
+  lutSrcHeight = currentSrcHeight;
+
+  // 1. Overscan and cropping offsets calculation
+  double overscanLeft = 0.00, overscanRight = 0.00;
+  double overscanTop = 0.00, overscanBottom = 0.00;
+
+#ifdef DISPLAY_CROPPED_INSTEAD_OF_SCALING
+  if (DISPLAY_DRAWABLE_WIDTH < (int)lutSrcWidth)
+  {
+    overscanLeft = (lutSrcWidth - DISPLAY_DRAWABLE_WIDTH) * 0.5 / lutSrcWidth;
+    overscanRight = overscanLeft;
+  }
+  if (DISPLAY_DRAWABLE_HEIGHT < (int)lutSrcHeight)
+  {
+    overscanTop = (lutSrcHeight - DISPLAY_DRAWABLE_HEIGHT) * 0.5 / lutSrcHeight;
+    overscanBottom = overscanTop;
+  }
+#endif
+
+  uint32_t srcCropStartX = ROUND_TO_NEAREST_INT(lutSrcWidth * overscanLeft);
+  uint32_t srcCropStartY = ROUND_TO_NEAREST_INT(lutSrcHeight * overscanTop);
+  int relevantWidth = ROUND_TO_NEAREST_INT(lutSrcWidth * (1.0 - overscanLeft - overscanRight));
+  int relevantHeight = ROUND_TO_NEAREST_INT(lutSrcHeight * (1.0 - overscanTop - overscanBottom));
+
+  // 2. Check if spatial rescaling is required
+  isRescalingNeeded = (lutSrcWidth != (uint32_t)gpuFrameWidth) ||
+                      (lutSrcHeight != (uint32_t)gpuFrameHeight) ||
+                      (srcCropStartX != 0) || (srcCropStartY != 0);
+
+  // 3. Reallocate LUT arrays
+  if (lutX) { free(lutX); lutX = nullptr; }
+  if (lutY) { free(lutY); lutY = nullptr; }
+
+  if (isRescalingNeeded)
+  {
+    lutX = (uint32_t *)Malloc(gpuFrameWidth * sizeof(uint32_t), "gpu.cpp lutX");
+    lutY = (uint32_t *)Malloc(gpuFrameHeight * sizeof(uint32_t), "gpu.cpp lutY");
+
+    for (int x = 0; x < gpuFrameWidth; ++x)
+    {
+      double normX = ((double)x + 0.5) / gpuFrameWidth;
+      uint32_t srcX = srcCropStartX + (uint32_t)(normX * relevantWidth);
+      if (srcX >= lutSrcWidth) srcX = lutSrcWidth - 1;
+      lutX[x] = srcX;
+    }
+
+    for (int y = 0; y < gpuFrameHeight; ++y)
+    {
+      double normY = ((double)y + 0.5) / gpuFrameHeight;
+      uint32_t srcY = srcCropStartY + (uint32_t)(normY * relevantHeight);
+      if (srcY >= lutSrcHeight) srcY = lutSrcHeight - 1;
+      lutY[y] = srcY;
+    }
+  }
+
+  // 4. Dynamically size scanline cache buffer to handle current source width
+  if (cachedSrcRowCapacityPixels < lutSrcWidth)
+  {
+    if (cachedSrcRow) free(cachedSrcRow);
+    cachedSrcRowCapacityPixels = lutSrcWidth + 128; // Padding safety buffer
+    cachedSrcRow = (uint32_t *)Malloc(cachedSrcRowCapacityPixels * sizeof(uint32_t), "gpu.cpp cachedSrcRow");
+  }
+
+  printf("[GPU] Rescale LUT updated: %dx%d -> %dx%d (%s)\n",
+         lutSrcWidth, lutSrcHeight, gpuFrameWidth, gpuFrameHeight,
+         isRescalingNeeded ? "RESCALING ACTIVE" : "1:1 DIRECT FAST-PATH");
+}
+
+// ------------------------------------------------------------------------
+// SNAPSHOT FRAMEBUFFER
+// ------------------------------------------------------------------------
 bool SnapshotFramebuffer(uint16_t *destination)
 {
   if (drmFd < 0 || drmCrtcId == 0)
     return false;
 
-  // 1. Query active CRTC
+  static uint32_t lastProcessedFbId = 0;
+
+  // ------------------------------------------------------------------------
+  // 0. KERNEL EVENT DRIVEN CACHE & LUT INVALIDATION
+  // ------------------------------------------------------------------------
+  if (CheckDrmUevents())
+  {
+    printf("[DRM] Kernel reported mode change / Sway reload! Flushing buffer cache.\n");
+    CleanupDrmBufferCache();
+    lutSrcWidth = 0;
+    lutSrcHeight = 0;
+    lastProcessedFbId = 0;
+  }
+
+  // ------------------------------------------------------------------------
+  // 1. QUERY CRTC AND ACTIVE DISPLAY MODE
+  // ------------------------------------------------------------------------
   drmModeCrtc *crtc = drmModeGetCrtc(drmFd, drmCrtcId);
   if (!crtc)
     return false;
 
   uint32_t fbId = crtc->buffer_id;
+  uint32_t activeWidth = crtc->mode.hdisplay;
+  uint32_t activeHeight = crtc->mode.vdisplay;
+  bool hasValidMode = crtc->mode_valid && (activeWidth > 0) && (activeHeight > 0);
   drmModeFreeCrtc(crtc);
 
   if (fbId == 0)
     return false;
 
   // ------------------------------------------------------------------------
-  // ZERO-COPY IDLE SHORT-CIRCUIT
+  // 2. FETCH OR MAP FRAMEBUFFER WITH ACTIVE-MODE FILTERING
   // ------------------------------------------------------------------------
-  static uint32_t lastProcessedFbId = 0;
-
   void *mappedPtr = nullptr;
   auto it = drmBufferCache.find(fbId);
 
   if (it != drmBufferCache.end())
   {
-    mappedPtr = it->second.ptr;
-    drmSrcWidth = it->second.width;
-    drmSrcHeight = it->second.height;
-    mappedFbPitch = it->second.pitch;
+    // Validate cached entry against active mode resolution
+    if (hasValidMode && (it->second.width != activeWidth || it->second.height != activeHeight))
+    {
+      // Cached buffer is from old display mode! Flush cache.
+      CleanupDrmBufferCache();
+      mappedPtr = nullptr;
+    }
+    else
+    {
+      mappedPtr = it->second.ptr;
+      drmSrcWidth = it->second.width;
+      drmSrcHeight = it->second.height;
+      mappedFbPitch = it->second.pitch;
+    }
   }
-  else
+
+  if (!mappedPtr)
   {
-    // Prevent buffer cache leak: Evict cache if Sway creates too many unique FBs
     if (drmBufferCache.size() > 16)
     {
       CleanupDrmBufferCache();
@@ -260,6 +462,22 @@ bool SnapshotFramebuffer(uint16_t *destination)
 
     drmModeFB2 *fb = drmModeGetFB2(drmFd, fbId);
     if (!fb) return false;
+
+    // HARDWARE FILTER: Reject transient framebuffers during mode transitions
+    if (hasValidMode && (fb->width != activeWidth || fb->height != activeHeight))
+    {
+      drmModeFreeFB2(fb);
+      return false; // Skip frame until Sway finishes switching resolutions
+    }
+
+    // Purge stale buffer cache if resolution actually changed
+    if (fb->width != lutSrcWidth || fb->height != lutSrcHeight)
+    {
+      printf("[DRM] Resolution shift (%ux%u -> %ux%u). Purging buffer cache.\n",
+             lutSrcWidth, lutSrcHeight, fb->width, fb->height);
+      CleanupDrmBufferCache();
+      lastProcessedFbId = 0;
+    }
 
     drmSrcWidth = fb->width;
     drmSrcHeight = fb->height;
@@ -284,6 +502,9 @@ bool SnapshotFramebuffer(uint16_t *destination)
   if (!mappedPtr || drmSrcWidth == 0 || drmSrcHeight == 0)
     return false;
 
+  // Ensure LUT state matches current framebuffer geometry
+  EnsureLutUpdated(drmSrcWidth, drmSrcHeight);
+
   bool is32bpp = (mappedFbPitch >= drmSrcWidth * 4);
 
   // Short-circuit if framebuffer hasn't flipped
@@ -303,29 +524,62 @@ bool SnapshotFramebuffer(uint16_t *destination)
   {
     lastProcessedFbId = fbId;
 
-    alignas(16) uint32_t cachedRow[640]; 
-    const uint32_t rowCopyBytes = gpuFrameWidth * 4;
-
-    for (uint32_t y = 0; y < gpuFrameHeight; ++y)
+    if (!isRescalingNeeded)
     {
-      const uint8_t *uncachedSrcRow = srcBytes + (y * mappedFbPitch);
-      uint16_t *dstRow = destination + (y * dstStride16);
+      // --------------------------------------------------------------------
+      // PATH A: 1:1 DIRECT FAST-PATH (No Scaling)
+      // --------------------------------------------------------------------
+      const uint32_t rowCopyBytes = gpuFrameWidth * 4;
 
-      memcpy(cachedRow, uncachedSrcRow, rowCopyBytes);
-
-      for (uint32_t x = 0; x < gpuFrameWidth; ++x)
+      for (uint32_t y = 0; y < gpuFrameHeight; ++y)
       {
-        uint32_t pixel = cachedRow[x];
-        uint8_t r = (pixel >> 16) & 0xFF;
-        uint8_t g = (pixel >> 8)  & 0xFF;
-        uint8_t b = pixel & 0xFF;
+        const uint8_t *uncachedSrcRow = srcBytes + (y * mappedFbPitch);
+        uint16_t *dstRow = destination + (y * dstStride16);
 
-        dstRow[x] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        memcpy(cachedSrcRow, uncachedSrcRow, rowCopyBytes);
+
+        for (uint32_t x = 0; x < gpuFrameWidth; ++x)
+        {
+          uint32_t pixel = cachedSrcRow[x];
+          uint8_t r = (pixel >> 16) & 0xFF;
+          uint8_t g = (pixel >> 8)  & 0xFF;
+          uint8_t b = pixel & 0xFF;
+
+          dstRow[x] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        }
+      }
+    }
+    else
+    {
+      // --------------------------------------------------------------------
+      // PATH B: OPTIMIZED LUT RESCALED PATH
+      // --------------------------------------------------------------------
+      const uint32_t rowCopyBytes = drmSrcWidth * 4;
+
+      for (uint32_t y = 0; y < gpuFrameHeight; ++y)
+      {
+        uint32_t srcY = lutY[y];
+        const uint8_t *uncachedSrcRow = srcBytes + (srcY * mappedFbPitch);
+        uint16_t *dstRow = destination + (y * dstStride16);
+
+        // Copy entire source scanline to CPU cache to avoid uncached read stalls
+        memcpy(cachedSrcRow, uncachedSrcRow, rowCopyBytes);
+
+        for (uint32_t x = 0; x < gpuFrameWidth; ++x)
+        {
+          uint32_t pixel = cachedSrcRow[lutX[x]];
+          uint8_t r = (pixel >> 16) & 0xFF;
+          uint8_t g = (pixel >> 8)  & 0xFF;
+          uint8_t b = pixel & 0xFF;
+
+          dstRow[x] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        }
       }
     }
   }
   else
   {
+    // 16bpp direct format fallback
     if (mappedFbPitch == dstPitchBytes)
     {
       memcpy(destination, srcBytes, gpuFrameHeight * dstPitchBytes);
@@ -390,46 +644,65 @@ void *gpu_polling_thread(void *)
   pthread_exit(0);
 }
 
-// ----------------------------------------------------------------------------
-// Initialization
-// ----------------------------------------------------------------------------
+// ------------------------------------------------------------------------
+// INIT GPU
+// ------------------------------------------------------------------------
 void InitGPU()
 {
-  // 1. Open DRM device node
-  drmFd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-  if (drmFd < 0)
-    FATAL_ERROR("Failed to open /dev/dri/card0");
-  drmDropMaster(drmFd);
-  printf("Opened DRM device /dev/dri/card0 successfully.\n");
-
-  // 2. Discover active CRTC
-  drmModeRes *res = drmModeGetResources(drmFd);
-  if (!res)
-    FATAL_ERROR("drmModeGetResources failed");
-
+  // 1 & 2. Auto-detect DRM device node with an active CRTC
   drmModeCrtc *crtc = nullptr;
-  for (int i = 0; i < res->count_crtcs; i++)
+  drmFd = -1;
+
+  for (int cardIdx = 0; cardIdx < 8; cardIdx++)
   {
-    drmModeCrtc *testCrtc = drmModeGetCrtc(drmFd, res->crtcs[i]);
-    if (!testCrtc)
+    char cardPath[32];
+    snprintf(cardPath, sizeof(cardPath), "/dev/dri/card%d", cardIdx);
+
+    int fd = open(cardPath, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
       continue;
 
-    if (testCrtc->buffer_id)
+    drmModeRes *res = drmModeGetResources(fd);
+    if (!res)
     {
-      crtc = testCrtc;
-      drmCrtcId = testCrtc->crtc_id;
+      close(fd);
+      continue;
+    }
+
+    // Search for an active CRTC with a bound framebuffer
+    for (int i = 0; i < res->count_crtcs; i++)
+    {
+      drmModeCrtc *testCrtc = drmModeGetCrtc(fd, res->crtcs[i]);
+      if (!testCrtc)
+        continue;
+
+      if (testCrtc->buffer_id)
+      {
+        crtc = testCrtc;
+        drmCrtcId = testCrtc->crtc_id;
+        drmFd = fd;
+        break;
+      }
+
+      drmModeFreeCrtc(testCrtc);
+    }
+
+    drmModeFreeResources(res);
+
+    // Found working display card
+    if (crtc)
+    {
+      drmDropMaster(drmFd);
+      printf("Opened DRM device %s successfully.\n", cardPath);
+      printf("Found active DRM CRTC %u\n", drmCrtcId);
       break;
     }
 
-    drmModeFreeCrtc(testCrtc);
+    close(fd);
   }
 
-  drmModeFreeResources(res);
-
-  if (!crtc)
-    FATAL_ERROR("No active CRTC with bound framebuffer found on DRM card0");
-
-  printf("Found active DRM CRTC %u\n", drmCrtcId);
+  if (drmFd < 0 || !crtc)
+    FATAL_ERROR("No active DRM display device or bound CRTC framebuffer found across card0-card7");
 
   // 3. Obtain geometry of primary framebuffer attached to CRTC
   drmModeFB2 *fb = drmModeGetFB2(drmFd, crtc->buffer_id);
@@ -502,18 +775,24 @@ void InitGPU()
          srcWidth, srcHeight, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_DRAWABLE_WIDTH, DISPLAY_DRAWABLE_HEIGHT,
          scaledWidth, scaledHeight, displayXOffset, displayYOffset);
 
-  // 5. Allocate double framebuffers
+  // ------------------------------------------------------------------------
+  // 5. INITIALIZE UEVENT LISTENER & BUILD INITIAL RESCALE LUT
+  // ------------------------------------------------------------------------
+  InitDrmUeventListener();
+  EnsureLutUpdated(srcWidth, srcHeight);
+
+  // 6. Allocate double framebuffers
   videoCoreFramebuffer[0] = (uint16_t *)Malloc(gpuFramebufferSizeBytes, "gpu.cpp framebuffer0");
   videoCoreFramebuffer[1] = (uint16_t *)Malloc(gpuFramebufferSizeBytes, "gpu.cpp framebuffer1");
   memset(videoCoreFramebuffer[0], 0, gpuFramebufferSizeBytes);
   memset(videoCoreFramebuffer[1], 0, gpuFramebufferSizeBytes);
 
-  // 6. Warm up frame-rate histogram
+  // 7. Warm up frame-rate histogram
   uint64_t now = tick();
   for (int i = 0; i < HISTOGRAM_SIZE; ++i)
     AddHistogramSample(now - 1000000ULL * (HISTOGRAM_SIZE - i) / TARGET_FRAME_RATE);
 
-  // 7. Spawn GPU polling thread
+  // 8. Spawn GPU polling thread
   int rc = pthread_create(&gpuPollingThread, NULL, gpu_polling_thread, NULL);
   if (rc != 0)
     FATAL_ERROR("Failed to create GPU polling thread!");
