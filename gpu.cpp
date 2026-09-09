@@ -316,79 +316,185 @@ static bool CheckDrmUevents()
 // ------------------------------------------------------------------------
 // DYNAMIC LUT REBUILD
 // ------------------------------------------------------------------------
-static void EnsureLutUpdated(uint32_t currentSrcWidth, uint32_t currentSrcHeight)
+static void EnsureLutUpdated(uint32_t currentSrcWidth,
+                             uint32_t currentSrcHeight)
 {
-  // Short-circuit if current LUT mapping matches active framebuffer dimensions
-  if (currentSrcWidth == lutSrcWidth && currentSrcHeight == lutSrcHeight && lutX != nullptr)
-    return;
+    // ------------------------------------------------------------------------
+    // IMPORTANT:
+    // In the 1:1 path lutX/lutY are intentionally nullptr.
+    // Therefore they must NOT be used to determine whether the LUT state
+    // is already valid.
+    // ------------------------------------------------------------------------
+    if (currentSrcWidth == lutSrcWidth &&
+        currentSrcHeight == lutSrcHeight &&
+        lutSrcWidth != 0 &&
+        lutSrcHeight != 0)
+    {
+        return;
+    }
 
-  lutSrcWidth = currentSrcWidth;
-  lutSrcHeight = currentSrcHeight;
+    lutSrcWidth = currentSrcWidth;
+    lutSrcHeight = currentSrcHeight;
 
-  // 1. Overscan and cropping offsets calculation
-  double overscanLeft = 0.00, overscanRight = 0.00;
-  double overscanTop = 0.00, overscanBottom = 0.00;
+    // ------------------------------------------------------------------------
+    // 1. Overscan and cropping offsets
+    // ------------------------------------------------------------------------
+    double overscanLeft = 0.00;
+    double overscanRight = 0.00;
+    double overscanTop = 0.00;
+    double overscanBottom = 0.00;
 
 #ifdef DISPLAY_CROPPED_INSTEAD_OF_SCALING
-  if (DISPLAY_DRAWABLE_WIDTH < (int)lutSrcWidth)
-  {
-    overscanLeft = (lutSrcWidth - DISPLAY_DRAWABLE_WIDTH) * 0.5 / lutSrcWidth;
-    overscanRight = overscanLeft;
-  }
-  if (DISPLAY_DRAWABLE_HEIGHT < (int)lutSrcHeight)
-  {
-    overscanTop = (lutSrcHeight - DISPLAY_DRAWABLE_HEIGHT) * 0.5 / lutSrcHeight;
-    overscanBottom = overscanTop;
-  }
+
+    if (DISPLAY_DRAWABLE_WIDTH < (int)lutSrcWidth)
+    {
+        overscanLeft =
+            (lutSrcWidth - DISPLAY_DRAWABLE_WIDTH) *
+            0.5 /
+            lutSrcWidth;
+
+        overscanRight = overscanLeft;
+    }
+
+    if (DISPLAY_DRAWABLE_HEIGHT < (int)lutSrcHeight)
+    {
+        overscanTop =
+            (lutSrcHeight - DISPLAY_DRAWABLE_HEIGHT) *
+            0.5 /
+            lutSrcHeight;
+
+        overscanBottom = overscanTop;
+    }
+
 #endif
 
-  uint32_t srcCropStartX = ROUND_TO_NEAREST_INT(lutSrcWidth * overscanLeft);
-  uint32_t srcCropStartY = ROUND_TO_NEAREST_INT(lutSrcHeight * overscanTop);
-  int relevantWidth = ROUND_TO_NEAREST_INT(lutSrcWidth * (1.0 - overscanLeft - overscanRight));
-  int relevantHeight = ROUND_TO_NEAREST_INT(lutSrcHeight * (1.0 - overscanTop - overscanBottom));
+    uint32_t srcCropStartX =
+        ROUND_TO_NEAREST_INT(
+            lutSrcWidth * overscanLeft);
 
-  // 2. Check if spatial rescaling is required
-  isRescalingNeeded = (lutSrcWidth != (uint32_t)gpuFrameWidth) ||
-                      (lutSrcHeight != (uint32_t)gpuFrameHeight) ||
-                      (srcCropStartX != 0) || (srcCropStartY != 0);
+    uint32_t srcCropStartY =
+        ROUND_TO_NEAREST_INT(
+            lutSrcHeight * overscanTop);
 
-  // 3. Reallocate LUT arrays
-  if (lutX) { free(lutX); lutX = nullptr; }
-  if (lutY) { free(lutY); lutY = nullptr; }
+    int relevantWidth =
+        ROUND_TO_NEAREST_INT(
+            lutSrcWidth *
+            (1.0 -
+             overscanLeft -
+             overscanRight));
 
-  if (isRescalingNeeded)
-  {
-    lutX = (uint32_t *)Malloc(gpuFrameWidth * sizeof(uint32_t), "gpu.cpp lutX");
-    lutY = (uint32_t *)Malloc(gpuFrameHeight * sizeof(uint32_t), "gpu.cpp lutY");
+    int relevantHeight =
+        ROUND_TO_NEAREST_INT(
+            lutSrcHeight *
+            (1.0 -
+             overscanTop -
+             overscanBottom));
 
-    for (int x = 0; x < gpuFrameWidth; ++x)
+    // ------------------------------------------------------------------------
+    // 2. Determine whether rescaling is needed
+    // ------------------------------------------------------------------------
+    isRescalingNeeded =
+        (lutSrcWidth != (uint32_t)gpuFrameWidth) ||
+        (lutSrcHeight != (uint32_t)gpuFrameHeight) ||
+        (srcCropStartX != 0) ||
+        (srcCropStartY != 0);
+
+    // ------------------------------------------------------------------------
+    // 3. Rebuild LUTs
+    // ------------------------------------------------------------------------
+    if (lutX)
     {
-      double normX = ((double)x + 0.5) / gpuFrameWidth;
-      uint32_t srcX = srcCropStartX + (uint32_t)(normX * relevantWidth);
-      if (srcX >= lutSrcWidth) srcX = lutSrcWidth - 1;
-      lutX[x] = srcX;
+        free(lutX);
+        lutX = nullptr;
     }
 
-    for (int y = 0; y < gpuFrameHeight; ++y)
+    if (lutY)
     {
-      double normY = ((double)y + 0.5) / gpuFrameHeight;
-      uint32_t srcY = srcCropStartY + (uint32_t)(normY * relevantHeight);
-      if (srcY >= lutSrcHeight) srcY = lutSrcHeight - 1;
-      lutY[y] = srcY;
+        free(lutY);
+        lutY = nullptr;
     }
-  }
 
-  // 4. Dynamically size scanline cache buffer to handle current source width
-  if (cachedSrcRowCapacityPixels < lutSrcWidth)
-  {
-    if (cachedSrcRow) free(cachedSrcRow);
-    cachedSrcRowCapacityPixels = lutSrcWidth + 128; // Padding safety buffer
-    cachedSrcRow = (uint32_t *)Malloc(cachedSrcRowCapacityPixels * sizeof(uint32_t), "gpu.cpp cachedSrcRow");
-  }
+    if (isRescalingNeeded)
+    {
+        lutX =
+            (uint32_t *)Malloc(
+                gpuFrameWidth * sizeof(uint32_t),
+                "gpu.cpp lutX");
 
-  printf("[GPU] Rescale LUT updated: %dx%d -> %dx%d (%s)\n",
-         lutSrcWidth, lutSrcHeight, gpuFrameWidth, gpuFrameHeight,
-         isRescalingNeeded ? "RESCALING ACTIVE" : "1:1 DIRECT FAST-PATH");
+        lutY =
+            (uint32_t *)Malloc(
+                gpuFrameHeight * sizeof(uint32_t),
+                "gpu.cpp lutY");
+
+        for (int x = 0;
+             x < gpuFrameWidth;
+             ++x)
+        {
+            double normX =
+                ((double)x + 0.5) /
+                gpuFrameWidth;
+
+            uint32_t srcX =
+                srcCropStartX +
+                (uint32_t)(
+                    normX * relevantWidth);
+
+            if (srcX >= lutSrcWidth)
+                srcX = lutSrcWidth - 1;
+
+            lutX[x] = srcX;
+        }
+
+        for (int y = 0;
+             y < gpuFrameHeight;
+             ++y)
+        {
+            double normY =
+                ((double)y + 0.5) /
+                gpuFrameHeight;
+
+            uint32_t srcY =
+                srcCropStartY +
+                (uint32_t)(
+                    normY * relevantHeight);
+
+            if (srcY >= lutSrcHeight)
+                srcY = lutSrcHeight - 1;
+
+            lutY[y] = srcY;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. Source row cache
+    // ------------------------------------------------------------------------
+    if (cachedSrcRowCapacityPixels < lutSrcWidth)
+    {
+        if (cachedSrcRow)
+            free(cachedSrcRow);
+
+        cachedSrcRowCapacityPixels =
+            lutSrcWidth + 128;
+
+        cachedSrcRow =
+            (uint32_t *)Malloc(
+                cachedSrcRowCapacityPixels *
+                    sizeof(uint32_t),
+                "gpu.cpp cachedSrcRow");
+    }
+
+    // ------------------------------------------------------------------------
+    // 5. This is now printed ONLY when geometry changed.
+    // ------------------------------------------------------------------------
+    printf(
+        "[GPU] Rescale LUT updated: %ux%u -> %dx%d (%s)\n",
+        lutSrcWidth,
+        lutSrcHeight,
+        gpuFrameWidth,
+        gpuFrameHeight,
+        isRescalingNeeded
+            ? "RESCALING ACTIVE"
+            : "1:1 DIRECT FAST-PATH");
 }
 
 // ------------------------------------------------------------------------
